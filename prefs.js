@@ -268,7 +268,7 @@ export default class HyperGnomePreferences extends ExtensionPreferences {
         });
         window.add(keybindingsPage);
 
-        this._buildKeybindingsPage(keybindingsPage, settings);
+        this._buildKeybindingsPage(keybindingsPage, settings, window);
 
         // Keep settings alive for the window lifetime
         window._settings = settings;
@@ -398,7 +398,7 @@ export default class HyperGnomePreferences extends ExtensionPreferences {
     // Keybindings page
     // =========================================================================
 
-    _buildKeybindingsPage(page, settings) {
+    _buildKeybindingsPage(page, settings, window) {
         // Static overrides — these are always active when the extension is enabled
         const STATIC_OVERRIDES = [
             {
@@ -541,26 +541,317 @@ export default class HyperGnomePreferences extends ExtensionPreferences {
             page.add(prefsGroup);
 
             for (const binding of group.bindings) {
-                const accels = settings.get_strv(binding.key);
-                const row = new Adw.ActionRow({
-                    title: binding.label,
-                });
-
-                const box = new Gtk.Box({
-                    spacing: 4,
-                    valign: Gtk.Align.CENTER,
-                });
-                for (const accel of accels) {
-                    if (accel) {
-                        box.append(new Gtk.ShortcutLabel({
-                            accelerator: accel,
-                        }));
-                    }
-                }
-                row.add_suffix(box);
+                const row = this._buildShortcutRow(binding, settings, window);
                 prefsGroup.add(row);
             }
         }
+    }
+
+    // =========================================================================
+    // Shortcut row + capture dialog
+    // =========================================================================
+
+    /**
+     * Build an editable row for a single HyperGnome keybinding.
+     * Each existing shortcut is shown as a clickable pill (click to change
+     * or remove that specific one). A "+" button appends a new shortcut.
+     * A reset button restores the schema default.
+     */
+    _buildShortcutRow(binding, settings, window) {
+        const {key, label} = binding;
+        const row = new Adw.ActionRow({
+            title: label,
+            activatable: true,
+        });
+
+        const pillsBox = new Gtk.Box({
+            spacing: 4,
+            valign: Gtk.Align.CENTER,
+        });
+
+        const refreshPills = () => {
+            let child = pillsBox.get_first_child();
+            while (child) {
+                const next = child.get_next_sibling();
+                pillsBox.remove(child);
+                child = next;
+            }
+            const accels = settings.get_strv(key).filter(a => a);
+            if (accels.length === 0) {
+                pillsBox.append(new Gtk.Label({
+                    label: _('Disabled'),
+                    css_classes: ['dim-label'],
+                }));
+            } else {
+                for (const accel of accels) {
+                    const pill = new Gtk.Button({
+                        tooltip_text: _('Click to change or remove'),
+                        valign: Gtk.Align.CENTER,
+                        css_classes: ['flat'],
+                    });
+                    pill.set_child(new Gtk.ShortcutLabel({accelerator: accel}));
+                    pill.connect('clicked', () => {
+                        this._openShortcutCapture(window, binding, settings, {
+                            action: 'replace',
+                            oldAccel: accel,
+                        });
+                    });
+                    pillsBox.append(pill);
+                }
+            }
+        };
+        refreshPills();
+        row.add_suffix(pillsBox);
+
+        const addBtn = new Gtk.Button({
+            icon_name: 'list-add-symbolic',
+            tooltip_text: _('Add another shortcut'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        addBtn.connect('clicked', () => {
+            this._openShortcutCapture(window, binding, settings, {action: 'add'});
+        });
+        row.add_suffix(addBtn);
+
+        const resetBtn = new Gtk.Button({
+            icon_name: 'edit-undo-symbolic',
+            tooltip_text: _('Reset to default'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        resetBtn.connect('clicked', () => settings.reset(key));
+        row.add_suffix(resetBtn);
+
+        // Clicking the row body (title area) triggers "add".
+        row.activatable_widget = addBtn;
+
+        const handlerId = settings.connect(`changed::${key}`, refreshPills);
+        row.connect('destroy', () => {
+            try {
+                settings.disconnect(handlerId);
+            } catch (_e) {
+                // Already disconnected
+            }
+        });
+
+        return row;
+    }
+
+    /**
+     * Open a modal dialog that captures a key combination for `binding.key`.
+     * Modes:
+     *   - {action: 'add'}                      → append the captured accel.
+     *   - {action: 'replace', oldAccel: '…'}   → replace that specific accel.
+     *     In replace mode, a "Remove" header button and Backspace delete
+     *     just this accelerator instead of the whole binding.
+     *
+     * Escape always cancels. System shortcuts (Super, etc.) are inhibited
+     * while the dialog is focused so the compositor doesn't swallow them.
+     */
+    _openShortcutCapture(parent, binding, settings, mode) {
+        const {key, label} = binding;
+        const {action, oldAccel} = mode;
+
+        const titleText = action === 'replace'
+            ? _('Change shortcut: %s').format(label)
+            : _('Add shortcut: %s').format(label);
+
+        const dialog = new Adw.Window({
+            title: titleText,
+            modal: true,
+            transient_for: parent,
+            default_width: 440,
+            default_height: 240,
+            resizable: false,
+        });
+
+        const header = new Adw.HeaderBar({
+            show_start_title_buttons: false,
+            show_end_title_buttons: false,
+        });
+        const cancelBtn = new Gtk.Button({label: _('Cancel')});
+        cancelBtn.connect('clicked', () => dialog.close());
+        header.pack_start(cancelBtn);
+
+        if (action === 'replace') {
+            const removeBtn = new Gtk.Button({
+                label: _('Remove'),
+                css_classes: ['destructive-action'],
+            });
+            removeBtn.connect('clicked', () => {
+                const remaining = settings.get_strv(key)
+                    .filter(a => a && a !== oldAccel);
+                settings.set_strv(key, remaining);
+                dialog.close();
+            });
+            header.pack_end(removeBtn);
+        }
+
+        const contentBox = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 12,
+            margin_top: 24,
+            margin_bottom: 24,
+            margin_start: 24,
+            margin_end: 24,
+            valign: Gtk.Align.CENTER,
+            halign: Gtk.Align.CENTER,
+        });
+
+        const promptLabel = new Gtk.Label({
+            label: _('Press the new key combination'),
+            css_classes: ['title-3'],
+        });
+        contentBox.append(promptLabel);
+
+        const hintText = action === 'replace'
+            ? _('Backspace to remove · Escape to cancel')
+            : _('Escape to cancel');
+        const hintLabel = new Gtk.Label({
+            label: hintText,
+            css_classes: ['dim-label'],
+        });
+        contentBox.append(hintLabel);
+
+        const warningLabel = new Gtk.Label({
+            label: '',
+            wrap: true,
+            justify: Gtk.Justification.CENTER,
+            margin_top: 8,
+        });
+        contentBox.append(warningLabel);
+
+        const toolbarView = new Adw.ToolbarView();
+        toolbarView.add_top_bar(header);
+        toolbarView.set_content(contentBox);
+        dialog.set_content(toolbarView);
+
+        // Once the dialog is mapped, inhibit system shortcuts so the
+        // compositor passes Super / overview triggers / etc. through to us.
+        dialog.connect('map', () => {
+            try {
+                const surface = dialog.get_surface();
+                if (surface && typeof surface.inhibit_system_shortcuts === 'function')
+                    surface.inhibit_system_shortcuts(null);
+            } catch (_e) {
+                // Surface/API not available — capture may still partially work.
+            }
+        });
+
+        const controller = new Gtk.EventControllerKey();
+        controller.connect('key-pressed', (_ctrl, keyval, keycode, state) => {
+            if (this._isModifierKey(keyval))
+                return Gdk.EVENT_PROPAGATE;
+
+            const mask = state & Gtk.accelerator_get_default_mod_mask();
+
+            if (keyval === Gdk.KEY_Escape && mask === 0) {
+                dialog.close();
+                return Gdk.EVENT_STOP;
+            }
+
+            if (keyval === Gdk.KEY_BackSpace && mask === 0) {
+                if (action === 'replace') {
+                    const remaining = settings.get_strv(key)
+                        .filter(a => a && a !== oldAccel);
+                    settings.set_strv(key, remaining);
+                }
+                dialog.close();
+                return Gdk.EVENT_STOP;
+            }
+
+            const isFunctionKey = keyval >= Gdk.KEY_F1 && keyval <= Gdk.KEY_F35;
+            if (mask === 0 && !isFunctionKey) {
+                warningLabel.label =
+                    _('Shortcut must include at least one modifier (Super, Ctrl, Alt, or Shift).');
+                warningLabel.remove_css_class('warning');
+                warningLabel.add_css_class('error');
+                return Gdk.EVENT_STOP;
+            }
+
+            if (!Gtk.accelerator_valid(keyval, mask)) {
+                warningLabel.label = _('Invalid shortcut.');
+                warningLabel.remove_css_class('warning');
+                warningLabel.add_css_class('error');
+                return Gdk.EVENT_STOP;
+            }
+
+            const accel = Gtk.accelerator_name_with_keycode(
+                null, keyval, keycode, mask);
+            if (!accel) {
+                warningLabel.label = _('Invalid shortcut.');
+                return Gdk.EVENT_STOP;
+            }
+
+            const current = settings.get_strv(key).filter(a => a);
+            const accelLower = accel.toLowerCase();
+
+            // Duplicate within the same action (only matters in 'add' mode,
+            // or 'replace' where the user picked the same combo again).
+            const alreadyHas = current.some((a, i) => {
+                if (action === 'replace' && a === oldAccel)
+                    return false;
+                return a.toLowerCase() === accelLower;
+            });
+            if (alreadyHas) {
+                warningLabel.label = _('This shortcut is already assigned to this action.');
+                warningLabel.remove_css_class('error');
+                warningLabel.add_css_class('warning');
+                return Gdk.EVENT_STOP;
+            }
+
+            // Cross-action conflict (with other HyperGnome bindings).
+            const conflict = this._findHyperGnomeConflict(accel, key, settings);
+            if (conflict) {
+                warningLabel.label =
+                    _('Already used by: %s. Remove it there first, or press another combination.')
+                        .format(conflict);
+                warningLabel.remove_css_class('error');
+                warningLabel.add_css_class('warning');
+                return Gdk.EVENT_STOP;
+            }
+
+            let newList;
+            if (action === 'replace')
+                newList = current.map(a => (a === oldAccel ? accel : a));
+            else
+                newList = [...current, accel];
+
+            settings.set_strv(key, newList);
+            dialog.close();
+            return Gdk.EVENT_STOP;
+        });
+        dialog.add_controller(controller);
+
+        dialog.present();
+    }
+
+    _isModifierKey(keyval) {
+        return keyval === Gdk.KEY_Control_L || keyval === Gdk.KEY_Control_R ||
+            keyval === Gdk.KEY_Shift_L || keyval === Gdk.KEY_Shift_R ||
+            keyval === Gdk.KEY_Alt_L || keyval === Gdk.KEY_Alt_R ||
+            keyval === Gdk.KEY_Super_L || keyval === Gdk.KEY_Super_R ||
+            keyval === Gdk.KEY_Meta_L || keyval === Gdk.KEY_Meta_R ||
+            keyval === Gdk.KEY_Hyper_L || keyval === Gdk.KEY_Hyper_R ||
+            keyval === Gdk.KEY_ISO_Level3_Shift ||
+            keyval === Gdk.KEY_ISO_Level5_Shift;
+    }
+
+    /**
+     * Return the human-readable label of a HyperGnome binding that already
+     * uses the given accelerator, or null if none does.
+     */
+    _findHyperGnomeConflict(accel, excludeKey, settings) {
+        const target = accel.toLowerCase();
+        const keys = settings.list_keys()
+            .filter(k => k.startsWith('tile-') && k !== excludeKey);
+        for (const k of keys) {
+            const accels = settings.get_strv(k);
+            if (accels.some(a => a && a.toLowerCase() === target))
+                return this._humanizeBindingName(k);
+        }
+        return null;
     }
 
     // =========================================================================
