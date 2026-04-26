@@ -931,11 +931,38 @@ export class TilingManager {
     }
 
     /**
-     * Tile all existing windows on the active workspace.
+     * Tile all existing windows on every workspace.
+     *
+     * Iterating every workspace (not just the active one) is required to
+     * keep tiling state consistent after events that wipe all trees —
+     * `monitors-changed` (which also fires on hibernate/resume when the
+     * display hardware is re-detected), toggling `tiling-enabled`, and
+     * initial enable. Previously only the active workspace was rebuilt,
+     * so returning to a non-visible workspace after one of these events
+     * left its windows un-tiled until the user toggled tiling on that
+     * workspace specifically.
+     *
+     * Sticky windows (`is_on_all_workspaces()`) appear in every
+     * workspace's `list_windows()`; `_findTreeContaining` is used instead
+     * of the tree-local `contains()` check so they are only inserted
+     * into the first workspace's tree we encounter.
      */
     _tileExistingWindows() {
-        const wsIndex = global.workspace_manager.get_active_workspace_index();
-        const ws = global.workspace_manager.get_active_workspace();
+        const wsManager = global.workspace_manager;
+        const nWorkspaces = wsManager.get_n_workspaces();
+        for (let wsIndex = 0; wsIndex < nWorkspaces; wsIndex++)
+            this._tileWorkspace(wsIndex);
+    }
+
+    /**
+     * Tile the windows on a specific workspace.
+     * @param {number} wsIndex
+     */
+    _tileWorkspace(wsIndex) {
+        const ws = global.workspace_manager.get_workspace_by_index(wsIndex);
+        if (!ws)
+            return;
+
         const nMonitors = global.display.get_n_monitors();
         const floatList = this._settings.get_strv('float-list');
 
@@ -955,7 +982,10 @@ export class TilingManager {
                 if (this._floatingWindows.has(metaWindow))
                     continue;
 
-                if (tree.contains(metaWindow))
+                // Skip if this window is already tracked in any tree —
+                // guards against double-inserting sticky windows and
+                // windows whose workspace migration hasn't settled yet.
+                if (this._findTreeContaining(metaWindow))
                     continue;
 
                 if (isMaximized(metaWindow))
