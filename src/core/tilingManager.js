@@ -686,6 +686,88 @@ export class TilingManager {
         tree.insert(metaWindow, splitTarget, defaultRatio, nodeRect);
         this._connectWindowSignals(metaWindow);
         this._applyLayout(wsIndex, monIndex);
+
+        // Some apps (Zen and other Firefox forks, Electron apps, slow
+        // Flatpak startups) don't honour the initial move_resize_frame
+        // issued from `_applyLayout`: their internal size negotiation
+        // isn't complete by the time `first-frame` fires, and the idle
+        // pass scheduled by `_scheduleDeferredLayout` runs while they
+        // are still mid-init. The visible result is the window sitting
+        // at GNOME's default size until something else (opening another
+        // window, maximize toggle) triggers another relayout. Re-check
+        // the new window at staggered delays and re-snap if its actual
+        // frame still diverges from the intended tiled rect.
+        this._scheduleNewWindowSettle(metaWindow);
+    }
+
+    /**
+     * Re-snap a newly inserted window to its intended tiled rect after
+     * short delays, in case the app rejected the initial resize.
+     *
+     * Some apps (Zen and other Firefox forks, Electron apps, slow Flatpak
+     * startups) negotiate their size after `first-frame` fires — sometimes
+     * for over a second after the window-created event. The idle pass
+     * scheduled by `_scheduleDeferredLayout` runs while these apps are
+     * still mid-init, so the intended rect doesn't take effect. The
+     * visible result is the new window sitting at GNOME's default size
+     * until something else (opening another window, maximize toggle)
+     * triggers another relayout.
+     *
+     * The retries below catch them. Each pass compares the window's
+     * actual frame to its intended `_hypergnomeTiledRect` and re-snaps
+     * only if they diverge beyond a small tolerance, so well-behaved
+     * apps incur no extra work after the first pass.
+     *
+     * @param {Meta.Window} metaWindow
+     */
+    _scheduleNewWindowSettle(metaWindow) {
+        // Staggered to cover both fast apps (~250ms) and slow Flatpak /
+        // session-restoring apps (Zen takes up to ~2s on cold start).
+        const DELAYS_MS = [250, 600, 1200, 2500];
+        const TOLERANCE_PX = 30;
+
+        for (const delay of DELAYS_MS) {
+            const sourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                this._deferredLayoutSources.delete(sourceId);
+                try {
+                    if (!this._enabled)
+                        return GLib.SOURCE_REMOVE;
+
+                    const intended = metaWindow._hypergnomeTiledRect;
+                    if (!intended)
+                        return GLib.SOURCE_REMOVE;
+
+                    if (this._floatingWindows.has(metaWindow))
+                        return GLib.SOURCE_REMOVE;
+                    if (!this._findTreeContaining(metaWindow))
+                        return GLib.SOURCE_REMOVE;
+
+                    let frame;
+                    try {
+                        frame = metaWindow.get_frame_rect();
+                    } catch (_e) {
+                        // Window destroyed between schedule and fire.
+                        return GLib.SOURCE_REMOVE;
+                    }
+
+                    if (metaWindow.minimized || metaWindow.is_fullscreen())
+                        return GLib.SOURCE_REMOVE;
+
+                    const dx = Math.abs(frame.x - intended.x);
+                    const dy = Math.abs(frame.y - intended.y);
+                    const dw = Math.abs(frame.width - intended.width);
+                    const dh = Math.abs(frame.height - intended.height);
+                    if (dx > TOLERANCE_PX || dy > TOLERANCE_PX ||
+                        dw > TOLERANCE_PX || dh > TOLERANCE_PX) {
+                        snapWindow(metaWindow, intended);
+                    }
+                } catch (e) {
+                    logError(e, 'HyperGnome: new-window settle pass');
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+            this._deferredLayoutSources.add(sourceId);
+        }
     }
 
     /**
